@@ -1,5 +1,5 @@
-import React, { useState, useEffect, useRef } from 'react';
-import { Search, MapPin, Building2, Globe, Download, Loader2, Play, Square, Terminal, Table as TableIcon, Settings, LayoutDashboard, ChevronDown, Check } from 'lucide-react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { Search, MapPin, Building2, Globe, Download, Loader2, Play, Square, Terminal, Table as TableIcon, Settings, LayoutDashboard, ChevronDown, Check, Leaf } from 'lucide-react';
 import Papa from 'papaparse';
 import * as XLSX from 'xlsx';
 import { motion, AnimatePresence } from 'framer-motion';
@@ -27,7 +27,9 @@ export default function App() {
   const [mode, setMode] = useState<SearchMode>('radius');
   const [city, setCity] = useState('');
   const [radius, setRadius] = useState(10);
-  
+  const [ecoMode, setEcoMode] = useState(false);
+  const [maxLeads, setMaxLeads] = useState<number>(0);
+
   const [selectedArea, setSelectedArea] = useState<SelectedArea>({
     label: `${plzData[0].kreis} (${plzData[0].plz})`,
     isBundesland: false,
@@ -61,13 +63,19 @@ export default function App() {
   const [selectedHistorySearch, setSelectedHistorySearch] = useState<any | null>(null);
   const historyDropdownRef = useRef<HTMLDivElement>(null);
 
+  const eventSourceRef = useRef<EventSource | null>(null);
+  const currentJobIdRef = useRef<string | null>(null);
+  const resultCountRef = useRef(0);
+  const logCountRef = useRef(0);
+  const logsEndRef = useRef<HTMLDivElement>(null);
+
   const filteredResults = results.filter(r => {
     if (!requireFullData) return true;
     return r.anrede && r.vorname && r.nachname && r.phone && r.email;
   });
 
-  const logsEndRef = useRef<HTMLDivElement>(null);
-  const eventSourceRef = useRef<EventSource | null>(null);
+  // Eco checkbox visible: always in radius mode, in landkreis mode only when whole Bundesland is selected
+  const showEco = mode === 'radius' || (mode === 'landkreis' && selectedArea.isBundesland);
 
   useEffect(() => {
     const handleClickOutside = (event: MouseEvent) => {
@@ -88,11 +96,106 @@ export default function App() {
     }
   }, [logs]);
 
+  const connectToJob = useCallback((jobId: string) => {
+    currentJobIdRef.current = jobId;
+
+    const connectSSE = () => {
+      const sse = new EventSource(
+        `/api/job-stream?jobId=${jobId}&lastResultCount=${resultCountRef.current}&lastLogCount=${logCountRef.current}`
+      );
+      eventSourceRef.current = sse;
+
+      sse.onmessage = (event) => {
+        const data = JSON.parse(event.data);
+
+        if (data.type === 'done') {
+          sse.close();
+          eventSourceRef.current = null;
+          currentJobIdRef.current = null;
+          setIsSearching(false);
+          localStorage.removeItem('activeJobId');
+          setLogs(prev => [...prev, {
+            id: Math.random().toString(),
+            type: 'done',
+            message: 'Aufgabe abgeschlossen.',
+            timestamp: new Date()
+          }]);
+          return;
+        }
+
+        if (data.type === 'result') {
+          resultCountRef.current++;
+          setResults(prev => {
+            if (prev.some(r => r.id === data.data.id && r.companyName === data.data.companyName)) return prev;
+            return [...prev, data.data];
+          });
+        } else {
+          logCountRef.current++;
+        }
+
+        setLogs(prev => [...prev, {
+          id: Math.random().toString(),
+          type: data.type,
+          message: data.message,
+          data: data.data,
+          timestamp: new Date()
+        }]);
+      };
+
+      sse.onerror = () => {
+        sse.close();
+        if (currentJobIdRef.current === jobId) {
+          setLogs(prev => [...prev, {
+            id: Math.random().toString(),
+            type: 'error',
+            message: 'Verbindung verloren. Versuche Neuverbindung...',
+            timestamp: new Date()
+          }]);
+          setTimeout(() => {
+            if (currentJobIdRef.current === jobId) {
+              connectSSE();
+            }
+          }, 3000);
+        }
+      };
+    };
+
+    connectSSE();
+  }, []);
+
+  // On mount: check if there's an active job from before a page refresh
+  useEffect(() => {
+    const savedJobId = localStorage.getItem('activeJobId');
+    if (!savedJobId) return;
+
+    fetch(`/api/job-status?jobId=${savedJobId}`)
+      .then(r => r.json())
+      .then(data => {
+        if (data.exists && !data.isDone) {
+          resultCountRef.current = 0;
+          logCountRef.current = 0;
+          setIsSearching(true);
+          setActiveTab('terminal');
+          setLogs([{
+            id: 'reconnect',
+            type: 'info',
+            message: 'Verbindung zum laufenden Scraping wiederhergestellt...',
+            timestamp: new Date()
+          }]);
+          connectToJob(savedJobId);
+        } else {
+          localStorage.removeItem('activeJobId');
+        }
+      })
+      .catch(() => localStorage.removeItem('activeJobId'));
+  }, [connectToJob]);
+
   const handleStart = async () => {
     if (eventSourceRef.current) {
       eventSourceRef.current.close();
       eventSourceRef.current = null;
     }
+    currentJobIdRef.current = null;
 
     const finalIndustries = [...industries];
     if (industryInput.trim() && !finalIndustries.includes(industryInput.trim())) {
@@ -110,6 +213,8 @@ export default function App() {
     setLogs([]);
     setResults([]);
     setActiveTab('terminal');
+    resultCountRef.current = 0;
+    logCountRef.current = 0;
 
     try {
       const res = await fetch('/api/start-job', {
@@ -120,69 +225,27 @@ export default function App() {
           mode,
           city: mode === 'radius' ? city : undefined,
           radius: mode === 'radius' ? radius : undefined,
-          plzEntries: mode === 'landkreis' ? selectedArea.plzEntries : undefined
+          plzEntries: mode === 'landkreis' ? selectedArea.plzEntries : undefined,
+          ecoMode: showEco ? ecoMode : false,
+          maxLeads: maxLeads > 0 ? maxLeads : 0
         })
       });
 
       if (!res.ok) throw new Error('Failed to start job');
-      
+
       const { jobId } = await res.json();
-      
-      let resultCount = 0;
-      let logCount = 0;
-
-      const connectSSE = () => {
-        const sse = new EventSource(`/api/job-stream?jobId=${jobId}&lastResultCount=${resultCount}&lastLogCount=${logCount}`);
-        eventSourceRef.current = sse;
-
-        sse.onmessage = (event) => {
-          const data = JSON.parse(event.data);
-          
-          if (data.type === 'done') {
-            sse.close();
-            setIsSearching(false);
-            setLogs(prev => [...prev, { id: Math.random().toString(), type: 'done', message: 'Aufgabe abgeschlossen.', timestamp: new Date() }]);
-            return;
-          }
-
-          if (data.type === 'result') {
-            resultCount++;
-            setResults(prev => {
-              if (prev.some(r => r.id === data.data.id && r.companyName === data.data.companyName)) return prev;
-              return [...prev, data.data];
-            });
-          } else {
-            logCount++;
-          }
-
-          setLogs(prev => [...prev, { 
-            id: Math.random().toString(), 
-            type: data.type, 
-            message: data.message,
-            data: data.data,
-            timestamp: new Date() 
-          }]);
-        };
-
-        sse.onerror = () => {
-          sse.close();
-          if (eventSourceRef.current) {
-            setLogs(prev => [...prev, { id: Math.random().toString(), type: 'error', message: 'Verbindung verloren. Versuche Neuverbindung...', timestamp: new Date() }]);
-            setTimeout(() => {
-              if (eventSourceRef.current) {
-                connectSSE();
-              }
-            }, 3000);
-          }
-        };
-      };
-
-      connectSSE();
+      localStorage.setItem('activeJobId', jobId);
+      connectToJob(jobId);
 
     } catch (error: any) {
       console.error(error);
       setIsSearching(false);
-      setLogs(prev => [...prev, { id: Math.random().toString(), type: 'error', message: error.message, timestamp: new Date() }]);
+      setLogs(prev => [...prev, {
+        id: Math.random().toString(),
+        type: 'error',
+        message: error.message,
+        timestamp: new Date()
+      }]);
     }
   };
 
@@ -191,8 +254,15 @@ export default function App() {
       eventSourceRef.current.close();
       eventSourceRef.current = null;
     }
+    currentJobIdRef.current = null;
+    localStorage.removeItem('activeJobId');
     setIsSearching(false);
-    setLogs(prev => [...prev, { id: Math.random().toString(), type: 'error', message: 'Aufgabe vom Benutzer gestoppt.', timestamp: new Date() }]);
+    setLogs(prev => [...prev, {
+      id: Math.random().toString(),
+      type: 'error',
+      message: 'Aufgabe vom Benutzer gestoppt.',
+      timestamp: new Date()
+    }]);
   };
 
   const exportCSV = () => {
@@ -239,12 +309,12 @@ export default function App() {
         return;
       }
       const data = await res.json();
-      
+
       let toExport = data;
       if (full) {
         toExport = data.filter((r: any) => r.anrede && r.vorname && r.nachname && r.phone && r.email);
       }
-      
+
       if (toExport.length === 0) {
         alert('Keine Ergebnisse zum Exportieren in der Historie.');
         return;
@@ -283,8 +353,7 @@ export default function App() {
 
   return (
     <div className="flex h-screen bg-[#0a0a0a] text-gray-300 font-sans overflow-hidden selection:bg-orange-500/30">
-      
-      {/* Sidebar */}
+
       <main className="flex-1 flex flex-col h-full overflow-hidden relative">
         {/* Topbar */}
         <header className="h-16 border-b border-white/10 flex items-center justify-between px-6 bg-[#0a0a0a]/80 backdrop-blur-md z-10">
@@ -294,7 +363,7 @@ export default function App() {
           </div>
           <div className="flex items-center gap-4">
             <div className="relative" ref={historyDropdownRef}>
-              <button 
+              <button
                 onClick={openHistory}
                 className="text-xs flex items-center gap-2 bg-white/5 hover:bg-white/10 px-3 py-1.5 rounded text-gray-300 transition-colors"
               >
@@ -302,7 +371,7 @@ export default function App() {
               </button>
               <AnimatePresence>
                 {isHistoryOpen && (
-                  <motion.div 
+                  <motion.div
                     initial={{ opacity: 0, y: 10 }}
                     animate={{ opacity: 1, y: 0 }}
                     exit={{ opacity: 0, y: 10 }}
@@ -316,9 +385,9 @@ export default function App() {
                             <div className="px-3 py-2 text-sm text-gray-400">Keine Historie vorhanden.</div>
                           ) : (
                             uniqueDates.map(date => (
-                              <button 
-                                key={date} 
-                                onClick={() => { setSelectedHistoryDate(date); setHistoryStep('search'); }} 
+                              <button
+                                key={date}
+                                onClick={() => { setSelectedHistoryDate(date); setHistoryStep('search'); }}
                                 className="text-left px-3 py-2 text-sm text-gray-300 hover:bg-white/5 rounded transition-colors flex justify-between items-center"
                               >
                                 <span>{date}</span>
@@ -328,7 +397,7 @@ export default function App() {
                           )}
                         </>
                       )}
-                      
+
                       {historyStep === 'search' && (
                         <>
                           <div className="flex items-center gap-2 px-3 py-2">
@@ -337,9 +406,9 @@ export default function App() {
                           </div>
                           <div className="h-px bg-white/10 my-1"></div>
                           {searchesForDate.map(search => (
-                            <button 
-                              key={search.id} 
-                              onClick={() => { setSelectedHistorySearch(search); setHistoryStep('download'); }} 
+                            <button
+                              key={search.id}
+                              onClick={() => { setSelectedHistorySearch(search); setHistoryStep('download'); }}
                               className="text-left px-3 py-2 text-sm text-gray-300 hover:bg-white/5 rounded transition-colors flex flex-col gap-1"
                             >
                               <span className="font-medium truncate w-full">{formatSearchLabel(search.config)}</span>
@@ -357,11 +426,11 @@ export default function App() {
                           </div>
                           <div className="h-px bg-white/10 my-1"></div>
                           <div className="px-3 py-2 text-xs text-orange-400 truncate w-full">{formatSearchLabel(selectedHistorySearch.config)}</div>
-                          
+
                           <div className="px-3 py-2 mt-2 text-xs font-semibold text-gray-500 uppercase">Vollständige Daten (mit E-Mail)</div>
                           <button onClick={() => downloadHistory('csv', true)} className="text-left px-3 py-2 text-sm text-gray-300 hover:bg-white/5 rounded transition-colors">Als CSV herunterladen</button>
                           <button onClick={() => downloadHistory('xlsx', true)} className="text-left px-3 py-2 text-sm text-gray-300 hover:bg-white/5 rounded transition-colors">Als XLSX herunterladen</button>
-                          
+
                           <div className="h-px bg-white/10 my-1"></div>
                           <div className="px-3 py-2 text-xs font-semibold text-gray-500 uppercase">Alle Daten</div>
                           <button onClick={() => downloadHistory('csv', false)} className="text-left px-3 py-2 text-sm text-gray-300 hover:bg-white/5 rounded transition-colors">Als CSV herunterladen</button>
@@ -373,18 +442,18 @@ export default function App() {
                 )}
               </AnimatePresence>
             </div>
-            <span className="text-xs font-mono text-gray-500">v2.1</span>
+            <span className="text-xs font-mono text-gray-500">v2.2</span>
           </div>
         </header>
 
         <div className="flex-1 overflow-y-auto p-6 flex flex-col gap-6">
-          
+
           {/* Configuration Panel */}
           <section className="bg-[#111] border border-white/10 rounded-xl p-6 shadow-2xl">
             <h3 className="text-sm font-semibold text-white uppercase tracking-wider mb-6 flex items-center gap-2">
               <Settings className="w-4 h-4" /> Aufgabenkonfiguration
             </h3>
-            
+
             <div className="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-4 gap-6">
               <div className="space-y-2">
                 <label className="text-xs font-medium text-gray-400 uppercase tracking-wider">Zielbranche</label>
@@ -399,24 +468,24 @@ export default function App() {
                         </button>
                       </span>
                     ))}
-                    <input 
-                      type="text" 
+                    <input
+                      type="text"
                       value={industryInput}
                       onChange={e => {
                         if (e.target.value.includes(',')) {
                           const parts = e.target.value.split(',');
                           const newIndustries = [...industries];
                           let lastPart = '';
-                          
+
                           parts.forEach((part, index) => {
                             const trimmed = part.trim();
                             if (index === parts.length - 1) {
-                              lastPart = part; // Keep the last part (after the last comma) as input if it doesn't end with comma, or empty if it does
+                              lastPart = part;
                             } else if (trimmed && !newIndustries.includes(trimmed)) {
                               newIndustries.push(trimmed);
                             }
                           });
-                          
+
                           setIndustries(newIndustries);
                           setIndustryInput(lastPart.startsWith(' ') ? lastPart.trimStart() : lastPart);
                         } else {
@@ -452,13 +521,13 @@ export default function App() {
               <div className="space-y-2">
                 <label className="text-xs font-medium text-gray-400 uppercase tracking-wider">Suchmodus</label>
                 <div className="flex bg-black/50 border border-white/10 rounded-lg p-1">
-                  <button 
+                  <button
                     onClick={() => setMode('radius')}
                     className={`flex-1 text-xs font-medium py-1.5 rounded-md transition-all ${mode === 'radius' ? 'bg-orange-600 text-white shadow-lg' : 'text-gray-400 hover:text-white'}`}
                   >
                     Radius-Raster
                   </button>
-                  <button 
+                  <button
                     onClick={() => setMode('landkreis')}
                     className={`flex-1 text-xs font-medium py-1.5 rounded-md transition-all ${mode === 'landkreis' ? 'bg-orange-600 text-white shadow-lg' : 'text-gray-400 hover:text-white'}`}
                   >
@@ -473,8 +542,8 @@ export default function App() {
                     <label className="text-xs font-medium text-gray-400 uppercase tracking-wider">Zentrum / Ort</label>
                     <div className="relative">
                       <MapPin className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-500" />
-                      <input 
-                        type="text" 
+                      <input
+                        type="text"
                         value={city}
                         onChange={e => setCity(e.target.value)}
                         placeholder="z.B. Berlin"
@@ -487,9 +556,9 @@ export default function App() {
                       <span>Radius</span>
                       <span className="text-orange-400">{radius} km</span>
                     </label>
-                    <input 
-                      type="range" 
-                      min="1" max="50" 
+                    <input
+                      type="range"
+                      min="1" max="50"
                       value={radius}
                       onChange={e => setRadius(Number(e.target.value))}
                       className="w-full accent-orange-500 mt-2"
@@ -497,7 +566,7 @@ export default function App() {
                   </div>
                 </>
               ) : (
-                <div className="space-y-2" ref={dropdownRef}>
+                <div className="space-y-2 xl:col-span-2" ref={dropdownRef}>
                   <label className="text-xs font-medium text-gray-400 uppercase tracking-wider">Bundesland oder Landkreis auswählen</label>
                   <div className="relative">
                     <button
@@ -594,16 +663,58 @@ export default function App() {
               )}
             </div>
 
-            <div className="mt-8 flex justify-end">
+            {/* Eco Mode + Max Leads row */}
+            <div className="mt-5 pt-5 border-t border-white/5 flex flex-wrap items-center gap-6">
+              <AnimatePresence>
+                {showEco && (
+                  <motion.div
+                    initial={{ opacity: 0, x: -10 }}
+                    animate={{ opacity: 1, x: 0 }}
+                    exit={{ opacity: 0, x: -10 }}
+                    className="flex items-center gap-2.5"
+                  >
+                    <div
+                      onClick={() => setEcoMode(!ecoMode)}
+                      className={`w-9 h-5 rounded-full cursor-pointer transition-colors relative ${ecoMode ? 'bg-green-600' : 'bg-white/10'}`}
+                    >
+                      <div className={`absolute top-0.5 w-4 h-4 rounded-full bg-white shadow transition-transform ${ecoMode ? 'translate-x-4' : 'translate-x-0.5'}`} />
+                    </div>
+                    <div className="flex items-center gap-1.5">
+                      <Leaf className={`w-3.5 h-3.5 ${ecoMode ? 'text-green-400' : 'text-gray-500'}`} />
+                      <span className={`text-xs font-medium ${ecoMode ? 'text-green-400' : 'text-gray-400'}`}>
+                        Eco-Modus
+                      </span>
+                    </div>
+                    <span className="text-xs text-gray-600">
+                      {mode === 'radius' ? '(nur Zentrum, kein Raster)' : '(nur kreisfreie Städte)'}
+                    </span>
+                  </motion.div>
+                )}
+              </AnimatePresence>
+
+              <div className="flex items-center gap-2.5">
+                <label className="text-xs font-medium text-gray-400 whitespace-nowrap">Max. Leads:</label>
+                <input
+                  type="number"
+                  min="0"
+                  value={maxLeads || ''}
+                  onChange={e => setMaxLeads(Math.max(0, parseInt(e.target.value) || 0))}
+                  placeholder="∞ unbegrenzt"
+                  className="w-36 bg-black/50 border border-white/10 rounded-lg px-3 py-1.5 text-sm text-white focus:ring-1 focus:ring-orange-500 focus:border-orange-500 outline-none transition-all placeholder-gray-600"
+                />
+              </div>
+            </div>
+
+            <div className="mt-6 flex justify-end">
               {isSearching ? (
-                <button 
+                <button
                   onClick={handleStop}
                   className="bg-red-500/10 text-red-500 border border-red-500/20 hover:bg-red-500/20 px-6 py-2.5 rounded-lg text-sm font-medium flex items-center gap-2 transition-all"
                 >
                   <Square className="w-4 h-4 fill-current" /> Aufgabe stoppen
                 </button>
               ) : (
-                <button 
+                <button
                   onClick={handleStart}
                   className="bg-orange-600 hover:bg-orange-500 text-white shadow-[0_0_20px_rgba(249,115,22,0.4)] px-8 py-2.5 rounded-lg text-sm font-medium flex items-center gap-2 transition-all"
                 >
@@ -616,13 +727,13 @@ export default function App() {
           {/* Output Area */}
           <section className="flex-1 flex flex-col min-h-[400px] bg-[#111] border border-white/10 rounded-xl overflow-hidden shadow-2xl">
             <div className="flex border-b border-white/10 bg-[#0a0a0a]">
-              <button 
+              <button
                 onClick={() => setActiveTab('terminal')}
                 className={`px-6 py-3 text-sm font-medium flex items-center gap-2 border-b-2 transition-all ${activeTab === 'terminal' ? 'border-orange-500 text-orange-400' : 'border-transparent text-gray-500 hover:text-gray-300'}`}
               >
                 <Terminal className="w-4 h-4" /> Live-Terminal
               </button>
-              <button 
+              <button
                 onClick={() => setActiveTab('results')}
                 className={`px-6 py-3 text-sm font-medium flex items-center gap-2 border-b-2 transition-all ${activeTab === 'results' ? 'border-orange-500 text-orange-400' : 'border-transparent text-gray-500 hover:text-gray-300'}`}
               >
@@ -632,10 +743,10 @@ export default function App() {
                 {activeTab === 'results' && results.length > 0 && (
                   <>
                     <div className="flex items-center gap-2 mr-2">
-                      <input 
-                        type="checkbox" 
-                        id="requireFullData" 
-                        checked={requireFullData} 
+                      <input
+                        type="checkbox"
+                        id="requireFullData"
+                        checked={requireFullData}
                         onChange={(e) => setRequireFullData(e.target.checked)}
                         className="accent-orange-500 w-4 h-4 rounded border-white/10 bg-black/50 cursor-pointer"
                       />
@@ -643,13 +754,13 @@ export default function App() {
                         Nur vollständige Daten
                       </label>
                     </div>
-                    <button 
+                    <button
                       onClick={exportCSV}
                       className="text-xs flex items-center gap-1 bg-white/5 hover:bg-white/10 px-3 py-1.5 rounded text-gray-300 transition-colors"
                     >
                       <Download className="w-3 h-3" /> CSV
                     </button>
-                    <button 
+                    <button
                       onClick={exportXLSX}
                       className="text-xs flex items-center gap-1 bg-white/5 hover:bg-white/10 px-3 py-1.5 rounded text-gray-300 transition-colors"
                     >
@@ -699,6 +810,9 @@ export default function App() {
                         <tr>
                           <th className="px-4 py-3 font-medium">Unternehmen</th>
                           <th className="px-4 py-3 font-medium">Branche</th>
+                          <th className="px-4 py-3 font-medium">PLZ</th>
+                          <th className="px-4 py-3 font-medium">Bundesland</th>
+                          <th className="px-4 py-3 font-medium">Kreis</th>
                           <th className="px-4 py-3 font-medium">Rating</th>
                           <th className="px-4 py-3 font-medium">Bewertungen</th>
                           <th className="px-4 py-3 font-medium">Anrede</th>
@@ -715,6 +829,9 @@ export default function App() {
                           <tr key={i} className="hover:bg-white/5 transition-colors">
                             <td className="px-4 py-3 text-white font-medium">{r.companyName || r.name}</td>
                             <td className="px-4 py-3 text-gray-300">{r.branche || r.industry || '-'}</td>
+                            <td className="px-4 py-3 text-gray-300">{r.plz || '-'}</td>
+                            <td className="px-4 py-3 text-gray-300">{r.bundesland || '-'}</td>
+                            <td className="px-4 py-3 text-gray-300">{r.kreis || '-'}</td>
                             <td className="px-4 py-3 text-gray-300">{r.rating || '-'}</td>
                             <td className="px-4 py-3 text-gray-300">{r.user_ratings_total || '-'}</td>
                             <td className="px-4 py-3 text-gray-300">{r.anrede || '-'}</td>
@@ -741,4 +858,3 @@ export default function App() {
     </div>
   );
 }
-

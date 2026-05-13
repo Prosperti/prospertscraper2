@@ -6,8 +6,8 @@ import fs from 'fs';
 import { fileURLToPath } from 'url';
 import axios from 'axios';
 import * as cheerio from 'cheerio';
-import { GoogleGenAI, Type } from '@google/genai';
 import { EventEmitter } from 'events';
+import XLSX from 'xlsx';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -30,7 +30,43 @@ interface JobState {
 
 const jobs = new Map<string, JobState>();
 
+// PLZ lookup map loaded from PLZ/PLZprufung.xlsx
+const plzLookup = new Map<string, { bundesland: string; kreis: string; typ: string }>();
+
+function loadPlzData() {
+  const filePath = path.join(process.cwd(), 'PLZ', 'PLZprufung.xlsx');
+  if (!fs.existsSync(filePath)) {
+    console.log('PLZ/PLZprufung.xlsx nicht gefunden - PLZ-Verifizierung deaktiviert');
+    return;
+  }
+  try {
+    const workbook = XLSX.readFile(filePath);
+    const sheet = workbook.Sheets[workbook.SheetNames[0]];
+    const rows = XLSX.utils.sheet_to_json<any>(sheet);
+    for (const row of rows) {
+      const plzRaw = row['PLZ'] ?? row['plz'] ?? '';
+      const plz = String(plzRaw).padStart(5, '0');
+      const bundesland = String(row['Bundesland'] ?? row['bundesland'] ?? '');
+      const kreis = String(row['Kreis'] ?? row['kreis'] ?? '');
+      const typ = String(row['Typ'] ?? row['typ'] ?? '');
+      if (plz && plz !== '00000') {
+        plzLookup.set(plz, { bundesland, kreis, typ });
+      }
+    }
+    console.log(`${plzLookup.size} PLZ-Einträge für Verifizierung geladen`);
+  } catch (e) {
+    console.error('PLZprufung.xlsx konnte nicht geladen werden:', e);
+  }
+}
+
+function extractPlzFromAddress(address: string): string {
+  const match = address.match(/\b(\d{5})\b/);
+  return match ? match[1] : '';
+}
+
 async function startServer() {
+  loadPlzData();
+
   const app = express();
   const PORT = 3000;
 
@@ -46,13 +82,27 @@ async function startServer() {
     const jobState: JobState = { emitter, results: [], logs: [], isDone: false };
     jobs.set(jobId, jobState);
 
-    // Start async processing
     processJob(jobId, req.body, jobState).catch(err => {
       emitter.emit('log', { type: 'error', message: err.message });
       emitter.emit('done');
     });
 
     res.json({ jobId });
+  });
+
+  // Returns whether a job is still active (used for page-refresh cache reconnect)
+  app.get('/api/job-status', (req, res) => {
+    const { jobId } = req.query;
+    const jobState = jobs.get(jobId as string);
+    if (!jobState) {
+      return res.json({ exists: false });
+    }
+    res.json({
+      exists: true,
+      isDone: jobState.isDone,
+      resultCount: jobState.results.length,
+      logCount: jobState.logs.length
+    });
   });
 
   app.get('/api/history', (req, res) => {
@@ -99,7 +149,7 @@ async function startServer() {
     for (let i = clientResultCount; i < jobState.results.length; i++) {
       res.write(`data: ${JSON.stringify({ type: 'result', data: jobState.results[i] })}\n\n`);
     }
-    
+
     for (let i = clientLogCount; i < jobState.logs.length; i++) {
       res.write(`data: ${JSON.stringify(jobState.logs[i])}\n\n`);
     }
@@ -128,7 +178,6 @@ async function startServer() {
 
   async function processJob(jobId: string, config: any, jobState: JobState) {
     const emitter = jobState.emitter;
-    // Wait a moment to ensure the client has time to connect to the SSE stream
     await new Promise(resolve => setTimeout(resolve, 500));
 
     const log = (msg: string, data?: any) => {
@@ -140,22 +189,24 @@ async function startServer() {
       jobState.results.push(result);
       emitter.emit('log', { type: 'result', data: result });
     };
-    
-    const { industry, industries, mode, city, lat, lng, radius, plzEntries } = config;
-    const apiKey = process.env.VITE_GOOGLE_MAPS_API_KEY;
 
-    const searchIndustries = Array.isArray(industries) && industries.length > 0 
-      ? industries 
+    const { industry, industries, mode, city, lat, lng, radius, plzEntries, maxLeads, ecoMode } = config;
+    const apiKey = process.env.VITE_GOOGLE_MAPS_API_KEY;
+    const maxLeadsLimit: number = (typeof maxLeads === 'number' && maxLeads > 0) ? maxLeads : Infinity;
+    const maxPagesPerPoint = 3;
+
+    const searchIndustries = Array.isArray(industries) && industries.length > 0
+      ? industries
       : (industry ? [industry] : []);
 
     if (searchIndustries.length === 0) {
-      log('Error: No industry provided.');
+      log('Fehler: Keine Branche angegeben.');
       emitter.emit('done');
       return;
     }
 
     if (!apiKey) {
-      log('Error: Google Maps API key is missing.');
+      log('Fehler: Google Maps API-Schlüssel fehlt.');
       emitter.emit('done');
       return;
     }
@@ -167,7 +218,7 @@ async function startServer() {
       let searchLng = lng;
 
       if ((!searchLat || !searchLng) && city) {
-        log(`Geocoding city: ${city}...`);
+        log(`Geocoding: ${city}...`);
         try {
           const geoResponse = await axios.get(`https://nominatim.openstreetmap.org/search`, {
             params: { q: city, format: 'json', limit: 1 },
@@ -176,55 +227,74 @@ async function startServer() {
           if (geoResponse.data && geoResponse.data.length > 0) {
             searchLat = parseFloat(geoResponse.data[0].lat);
             searchLng = parseFloat(geoResponse.data[0].lon);
-            log(`Geocoded to: ${searchLat}, ${searchLng}`);
+            log(`Geocoded: ${searchLat}, ${searchLng}`);
           } else {
-            throw new Error('City could not be found.');
+            throw new Error('Stadt nicht gefunden.');
           }
         } catch (err) {
-          throw new Error('Geocoding failed.');
+          throw new Error('Geocoding fehlgeschlagen.');
         }
       }
 
       const searchRadiusKm = radius || 10;
-      log(`Generating grid for radius ${searchRadiusKm}km around ${searchLat}, ${searchLng}...`);
-      
-      for (const ind of searchIndustries) {
-        pointsToSearch.push({ lat: searchLat, lng: searchLng, query: ind, industry: ind });
 
-        if (searchRadiusKm > 2) {
-          const maxGridPoints = Math.max(4, Math.floor(searchRadiusKm));
-          const requiredStepKm = Math.sqrt((Math.PI * searchRadiusKm * searchRadiusKm) / maxGridPoints);
-          const stepKm = Math.max(3.0, requiredStepKm); 
-          
-          const steps = Math.ceil(searchRadiusKm / stepKm);
-          const latStep = stepKm / 111.32;
-          const lngStep = stepKm / (111.32 * Math.cos(searchLat * Math.PI / 180));
+      if (ecoMode) {
+        log(`Eco-Modus aktiv: Suche nur im Zentrum (${searchLat?.toFixed(4)}, ${searchLng?.toFixed(4)}).`);
+        for (const ind of searchIndustries) {
+          pointsToSearch.push({ lat: searchLat, lng: searchLng, query: ind, industry: ind });
+        }
+      } else {
+        log(`Erzeuge Suchgitter für Radius ${searchRadiusKm}km um ${searchLat}, ${searchLng}...`);
+        for (const ind of searchIndustries) {
+          pointsToSearch.push({ lat: searchLat, lng: searchLng, query: ind, industry: ind });
 
-          for (let dx = -steps; dx <= steps; dx++) {
-            for (let dy = -steps; dy <= steps; dy++) {
-              if (dx === 0 && dy === 0) continue;
-              const distKm = Math.sqrt(dx*dx + dy*dy) * stepKm;
-              if (distKm <= searchRadiusKm) {
-                pointsToSearch.push({
-                  lat: searchLat + dx * latStep,
-                  lng: searchLng + dy * lngStep,
-                  query: ind,
-                  industry: ind
-                });
+          if (searchRadiusKm > 2) {
+            const maxGridPoints = Math.max(4, Math.floor(searchRadiusKm));
+            const requiredStepKm = Math.sqrt((Math.PI * searchRadiusKm * searchRadiusKm) / maxGridPoints);
+            const stepKm = Math.max(3.0, requiredStepKm);
+
+            const steps = Math.ceil(searchRadiusKm / stepKm);
+            const latStep = stepKm / 111.32;
+            const lngStep = stepKm / (111.32 * Math.cos(searchLat * Math.PI / 180));
+
+            for (let dx = -steps; dx <= steps; dx++) {
+              for (let dy = -steps; dy <= steps; dy++) {
+                if (dx === 0 && dy === 0) continue;
+                const distKm = Math.sqrt(dx*dx + dy*dy) * stepKm;
+                if (distKm <= searchRadiusKm) {
+                  pointsToSearch.push({
+                    lat: searchLat + dx * latStep,
+                    lng: searchLng + dy * lngStep,
+                    query: ind,
+                    industry: ind
+                  });
+                }
               }
             }
           }
         }
+        log(`${pointsToSearch.length} Suchpunkte erzeugt.`);
       }
-      log(`Generated ${pointsToSearch.length} grid points.`);
     } else if (mode === 'landkreis') {
-      const entries: { plz: string; kreis: string; bundesland: string }[] = Array.isArray(plzEntries) ? plzEntries : [];
+      let entries: { plz: string; kreis: string; bundesland: string }[] = Array.isArray(plzEntries) ? plzEntries : [];
       if (entries.length === 0) {
         log('Fehler: Keine PLZ-Einträge erhalten.');
         emitter.emit('done');
         return;
       }
-      log(`Landkreis-Modus: ${entries.length} PLZ-Eintr${entries.length === 1 ? 'ag' : 'äge'} ausgewählt.`);
+
+      // Eco mode for Bundesland: filter to only kreisfreie Städte (Typ='Stadt' in PLZprufung.xlsx)
+      if (ecoMode && entries.length > 1) {
+        const stadtEntries = entries.filter(e => plzLookup.get(e.plz)?.typ === 'Stadt');
+        if (stadtEntries.length > 0) {
+          log(`Eco-Modus: ${stadtEntries.length} von ${entries.length} Einträgen ausgewählt (nur kreisfreie Städte).`);
+          entries = stadtEntries;
+        } else {
+          log(`Eco-Modus: Keine kreisfreien Städte gefunden, nutze alle ${entries.length} Einträge.`);
+        }
+      } else {
+        log(`Landkreis-Modus: ${entries.length} PLZ-Eintr${entries.length === 1 ? 'ag' : 'äge'} ausgewählt.`);
+      }
 
       for (const ind of searchIndustries) {
         for (const entry of entries) {
@@ -233,23 +303,27 @@ async function startServer() {
       }
     }
 
-    const allResults: any[] = [];
     const seenPlaceIds = new Set<string>();
+    let stopped = false;
 
     for (let i = 0; i < pointsToSearch.length; i++) {
+      if (stopped) break;
       const point = pointsToSearch[i];
+
       if (point.lat !== undefined && point.lng !== undefined) {
-        log(`[${i+1}/${pointsToSearch.length}] PLACES QUERY: "${point.query}" | location: ${point.lat.toFixed(4)},${point.lng.toFixed(4)} | radius: 5000m`);
+        log(`[${i+1}/${pointsToSearch.length}] Suche: "${point.query}" @ ${point.lat.toFixed(4)},${point.lng.toFixed(4)}`);
       } else {
         const loc = point.kreis ? ` | Kreis: ${point.kreis}, PLZ: ${point.plz}` : '';
-        log(`[${i+1}/${pointsToSearch.length}] PLACES QUERY: "${point.query}"${loc}`);
+        log(`[${i+1}/${pointsToSearch.length}] Suche: "${point.query}"${loc}`);
       }
-      console.log(`[JOB ${jobId}][${i+1}/${pointsToSearch.length}] PLACES QUERY: "${point.query}"${point.lat !== undefined ? ` @ ${point.lat.toFixed(4)},${point.lng.toFixed(4)}` : point.kreis ? ` | Kreis: ${point.kreis}` : ''}`);
-      
+      console.log(`[JOB ${jobId}][${i+1}/${pointsToSearch.length}] QUERY: "${point.query}"`);
+
+      const newPlaces: any[] = [];
+
       try {
         let nextPageToken = '';
         let pagesFetched = 0;
-        
+
         do {
           let placesResponse;
           let retries = 0;
@@ -264,7 +338,7 @@ async function startServer() {
                 ...(nextPageToken ? { pagetoken: nextPageToken } : {})
               }
             });
-            
+
             if (placesResponse.data.status === 'INVALID_REQUEST' && nextPageToken) {
               await new Promise(resolve => setTimeout(resolve, 2000));
               retries++;
@@ -272,92 +346,106 @@ async function startServer() {
               break;
             }
           }
-          
+
           const results = placesResponse?.data?.results || [];
-          let newPlaces = 0;
+          let newCount = 0;
           for (const place of results) {
             if (!seenPlaceIds.has(place.place_id)) {
               seenPlaceIds.add(place.place_id);
-              allResults.push({ ...place, _industry: point.industry });
-              newPlaces++;
+              newPlaces.push({ ...place, _industry: point.industry });
+              newCount++;
             }
           }
-          
-          log(`  -> Found ${newPlaces} new places on page ${pagesFetched + 1}`);
-          
+
+          log(`  -> ${newCount} neue Orte auf Seite ${pagesFetched + 1}`);
+
           nextPageToken = placesResponse?.data?.next_page_token;
           pagesFetched++;
-          
+
           if (nextPageToken) {
             await new Promise(resolve => setTimeout(resolve, 2000));
           }
-        } while (nextPageToken && pagesFetched < 3);
-        
+        } while (nextPageToken && pagesFetched < maxPagesPerPoint);
+
       } catch (err) {
-        log(`  -> Search failed for query "${point.query}"`);
+        log(`  -> Suche fehlgeschlagen für "${point.query}"`);
       }
-    }
 
-    log(`Total unique places found: ${allResults.length}. Starting detailed analysis...`);
+      log(`  -> ${newPlaces.length} neue Orte gefunden, starte Analyse...`);
 
-    for (let i = 0; i < allResults.length; i++) {
-      const place = allResults[i];
-      log(`[${i+1}/${allResults.length}] Analyzing: ${place.name}`);
-      
-      let website = '';
-      let phone = '';
-      let address = place.formatted_address || '';
+      // Process each place immediately (interleaved: search → scrape → add → next point)
+      for (let j = 0; j < newPlaces.length; j++) {
+        if (stopped) break;
+        const place = newPlaces[j];
+        log(`  [${j+1}/${newPlaces.length}] Analysiere: ${place.name}`);
 
-      if (place.place_id) {
-        try {
-          const detailsResponse = await axios.get(`https://maps.googleapis.com/maps/api/place/details/json`, {
-            params: {
-              place_id: place.place_id,
-              fields: 'website,formatted_phone_number',
-              key: apiKey
-            }
-          });
-          website = detailsResponse.data.result?.website || '';
-          phone = detailsResponse.data.result?.formatted_phone_number || '';
-        } catch (err) {
-          // ignore
+        let website = '';
+        let phone = '';
+        const address = place.formatted_address || '';
+
+        if (place.place_id) {
+          try {
+            const detailsResponse = await axios.get(`https://maps.googleapis.com/maps/api/place/details/json`, {
+              params: {
+                place_id: place.place_id,
+                fields: 'website,formatted_phone_number',
+                key: apiKey
+              }
+            });
+            website = detailsResponse.data.result?.website || '';
+            phone = detailsResponse.data.result?.formatted_phone_number || '';
+          } catch (err) {
+            // ignore
+          }
         }
-      }
 
-      let aiData = null;
-      if (website) {
-        log(`  -> Scraping website: ${website}`);
-        aiData = await analyzeWebsite(website);
-        if (aiData) {
-          log(`  -> Extracted data: ${aiData.firstName} ${aiData.lastName}, ${aiData.email}`);
+        let aiData = null;
+        if (website) {
+          log(`  -> Scraping: ${website}`);
+          aiData = await analyzeWebsite(website);
+          if (aiData) {
+            log(`  -> Extrahiert: ${aiData.firstName} ${aiData.lastName}, ${aiData.email}`);
+          } else {
+            log(`  -> Keine Daten von Website extrahiert.`);
+          }
         } else {
-          log(`  -> Failed to extract data from website.`);
+          log(`  -> Keine Website gefunden.`);
         }
-      } else {
-        log(`  -> No website found.`);
+
+        // PLZ verification against PLZprufung.xlsx
+        const plz = extractPlzFromAddress(address);
+        const plzInfo = plz ? plzLookup.get(plz) : undefined;
+
+        const resultObj = {
+          id: place.place_id,
+          companyName: aiData?.companyName || place.name,
+          branche: place._industry || '',
+          anrede: aiData?.salutation || '',
+          vorname: aiData?.firstName || '',
+          nachname: aiData?.lastName || '',
+          phone: aiData?.phone || phone || '',
+          email: aiData?.email || '',
+          website: website,
+          address: address,
+          plz: plz || '',
+          bundesland: plzInfo?.bundesland || '',
+          kreis: plzInfo?.kreis || '',
+          status: place.business_status || 'OPERATIONAL',
+          rating: place.rating || '',
+          user_ratings_total: place.user_ratings_total || '',
+          homepage_inhalt: aiData?.homepage_inhalt || ''
+        };
+
+        addResult(resultObj);
+
+        if (jobState.results.length >= maxLeadsLimit) {
+          log(`✅ Maximale Anzahl von ${maxLeads} Leads erreicht. Scraping wird beendet.`);
+          stopped = true;
+        }
       }
-
-      const resultObj = {
-        id: place.place_id,
-        companyName: aiData?.companyName || place.name,
-        branche: place._industry || '',
-        anrede: aiData?.salutation || '',
-        vorname: aiData?.firstName || '',
-        nachname: aiData?.lastName || '',
-        phone: aiData?.phone || phone || '',
-        email: aiData?.email || '',
-        website: website,
-        address: address,
-        status: place.business_status || 'OPERATIONAL',
-        rating: place.rating || '',
-        user_ratings_total: place.user_ratings_total || '',
-        homepage_inhalt: aiData?.homepage_inhalt || ''
-      };
-
-      addResult(resultObj);
     }
 
-    log('Job completed successfully.');
+    log('Job erfolgreich abgeschlossen.');
     try {
       const historyDir = path.join(process.cwd(), 'data', 'history');
       if (!fs.existsSync(historyDir)) {
@@ -368,7 +456,7 @@ async function startServer() {
       if (fs.existsSync(indexFile)) {
         historyIndex = JSON.parse(fs.readFileSync(indexFile, 'utf-8'));
       }
-      
+
       const searchId = Date.now().toString();
       const meta = {
         id: searchId,
@@ -387,12 +475,12 @@ async function startServer() {
         },
         resultCount: jobState.results.length
       };
-      
+
       historyIndex.unshift(meta);
       fs.writeFileSync(indexFile, JSON.stringify(historyIndex, null, 2));
       fs.writeFileSync(path.join(historyDir, `${searchId}.json`), JSON.stringify(jobState.results, null, 2));
     } catch (e) {
-      console.error('Failed to save job results:', e);
+      console.error('Verlaufsspeicherung fehlgeschlagen:', e);
     }
     jobState.isDone = true;
     emitter.emit('done');
@@ -444,17 +532,15 @@ async function startServer() {
       const linksArray = Array.from(internalLinks);
       const imprintLink = linksArray.find(l => /impressum|imprint|legal/i.test(l)) || `${targetUrl}/impressum`;
       const contactLink = linksArray.find(l => /kontakt|contact/i.test(l)) || `${targetUrl}/kontakt`;
-      
+
       const pagesData = await Promise.all([imprintLink, contactLink].map(l => fetchPage(l)));
 
       let combinedText = homeData.text;
       for (const page of pagesData) {
         if (page.ok) combinedText += '\n' + page.text;
       }
-      
+
       combinedText = combinedText.replace(/\s+/g, ' ');
-      
-      // E-Mail Bereinigung
       combinedText = combinedText.replace(/\[email\s*protected\]/gi, '');
       combinedText = combinedText.replace(/\(email\s*protected\)/gi, '');
       combinedText = combinedText.replace(/\s*\[at\]\s*/gi, '@');
@@ -477,7 +563,7 @@ async function startServer() {
       let lastName = '';
       let salutation = '';
       let companyName = '';
-      
+
       try {
         const OpenAI = (await import('openai')).default;
         const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
@@ -511,7 +597,7 @@ ${combinedText.substring(0, 6000)}`;
           if (result.email) email = result.email;
         }
       } catch (e) {
-        console.error("OpenAI extraction failed:", e);
+        console.error("OpenAI-Extraktion fehlgeschlagen:", e);
       }
 
       return {
@@ -525,12 +611,11 @@ ${combinedText.substring(0, 6000)}`;
       };
 
     } catch (error: any) {
-      console.error('Error analyzing website:', error);
+      console.error('Fehler bei Website-Analyse:', error);
       return null;
     }
   }
 
-  // API Route to search places
   app.post('/api/search-places', async (req, res) => {
     try {
       const { industry, city, lat, lng, radius } = req.body;
@@ -543,7 +628,6 @@ ${combinedText.substring(0, 6000)}`;
       let searchLat = lat;
       let searchLng = lng;
 
-      // 1. Geocode city if lat/lng are missing
       if ((!searchLat || !searchLng) && city) {
         try {
           const geoResponse = await axios.get(`https://nominatim.openstreetmap.org/search`, {
@@ -565,36 +649,28 @@ ${combinedText.substring(0, 6000)}`;
         return res.status(400).json({ error: 'Could not determine search location.' });
       }
 
-      // 2. Gebietsmodul: Generate search grid internally (No external API)
       const searchRadiusKm = radius || 10;
       const searchRadiusMeters = searchRadiusKm * 1000;
-      
+
       const pointsToSearch: {lat: number, lng: number}[] = [];
-      pointsToSearch.push({ lat: searchLat, lng: searchLng }); // Center
+      pointsToSearch.push({ lat: searchLat, lng: searchLng });
 
       let apiSearchRadiusMeters = searchRadiusMeters;
 
-      // If radius is > 2km, we create a grid to cover the area
       if (searchRadiusKm > 2) {
-        // User requested 4 grids per 4 km (which equals 1 grid per km of radius)
         const maxGridPoints = Math.max(4, Math.floor(searchRadiusKm));
-        
-        // Calculate required step size to stay under maxGridPoints
         const requiredStepKm = Math.sqrt((Math.PI * searchRadiusKm * searchRadiusKm) / maxGridPoints);
-        const stepKm = Math.max(3.0, requiredStepKm); // At least 3km step to reduce points
-        
-        apiSearchRadiusMeters = Math.ceil(stepKm * 1000 * 0.75); // 75% of step size to ensure overlap
+        const stepKm = Math.max(3.0, requiredStepKm);
+
+        apiSearchRadiusMeters = Math.ceil(stepKm * 1000 * 0.75);
 
         const steps = Math.ceil(searchRadiusKm / stepKm);
         const latStep = stepKm / 111.32;
         const lngStep = stepKm / (111.32 * Math.cos(searchLat * Math.PI / 180));
 
-        // Grid around the center
         for (let dx = -steps; dx <= steps; dx++) {
           for (let dy = -steps; dy <= steps; dy++) {
-            if (dx === 0 && dy === 0) continue; // Already added center
-            
-            // Check if point is within the main radius
+            if (dx === 0 && dy === 0) continue;
             const distKm = Math.sqrt(dx*dx + dy*dy) * stepKm;
             if (distKm <= searchRadiusKm) {
               pointsToSearch.push({
@@ -604,8 +680,7 @@ ${combinedText.substring(0, 6000)}`;
             }
           }
         }
-        
-        // Strictly enforce the maximum number of points to prevent timeouts
+
         if (pointsToSearch.length > maxGridPoints) {
            const center = pointsToSearch[0];
            const others = pointsToSearch.slice(1);
@@ -618,19 +693,15 @@ ${combinedText.substring(0, 6000)}`;
         }
       }
 
-      console.log(`Searching in ${pointsToSearch.length} grid points to cover the area.`);
-
-      // 3. Search using Google Places API for each grid point
       const allResults: any[] = [];
       const seenPlaceIds = new Set<string>();
 
       for (const point of pointsToSearch) {
-        // If we are searching multiple grid points, don't restrict by city name to find surrounding towns
         const query = (pointsToSearch.length > 1) ? industry : (city ? `${industry} in ${city}` : industry);
         try {
           let nextPageToken = '';
           let pagesFetched = 0;
-          
+
           do {
             let placesResponse;
             let retries = 0;
@@ -645,7 +716,7 @@ ${combinedText.substring(0, 6000)}`;
                   ...(nextPageToken ? { pagetoken: nextPageToken } : {})
                 }
               });
-              
+
               if (placesResponse.data.status === 'INVALID_REQUEST' && nextPageToken) {
                 await new Promise(resolve => setTimeout(resolve, 2000));
                 retries++;
@@ -653,7 +724,7 @@ ${combinedText.substring(0, 6000)}`;
                 break;
               }
             }
-            
+
             const results = placesResponse?.data?.results || [];
             for (const place of results) {
               if (!seenPlaceIds.has(place.place_id)) {
@@ -661,24 +732,22 @@ ${combinedText.substring(0, 6000)}`;
                 allResults.push(place);
               }
             }
-            
+
             nextPageToken = placesResponse?.data?.next_page_token;
             pagesFetched++;
-            
-            // Wait a bit before next page (Google requirement)
+
             if (nextPageToken) {
               await new Promise(resolve => setTimeout(resolve, 2000));
             }
-          } while (nextPageToken && pagesFetched < 3); // Fetch up to 3 pages (max 60 results) per grid point
-          
+          } while (nextPageToken && pagesFetched < 3);
+
         } catch (err) {
           console.error(`Search failed for location ${point.lat},${point.lng}`);
         }
       }
 
-      // 4. Format results and get additional details
       const detailedCompanies = [];
-      const batchSize = 10; // Process 10 places at a time to speed up details fetching
+      const batchSize = 10;
 
       for (let i = 0; i < allResults.length; i += batchSize) {
         const batch = allResults.slice(i, i + batchSize);
@@ -689,7 +758,6 @@ ${combinedText.substring(0, 6000)}`;
           let zip = '';
           let placeCity = '';
 
-          // Extract zip and city
           const addressParts = address.split(',');
           if (addressParts.length >= 2) {
             const zipCityPart = addressParts[addressParts.length - 2].trim();
@@ -733,12 +801,12 @@ ${combinedText.substring(0, 6000)}`;
             source: 'Google Places'
           };
         });
-        
+
         const resolvedBatch = await Promise.all(batchPromises);
         detailedCompanies.push(...resolvedBatch);
       }
 
-      res.json({ 
+      res.json({
         companies: detailedCompanies,
         resolvedLocation: { lat: searchLat, lng: searchLng }
       });
@@ -749,7 +817,6 @@ ${combinedText.substring(0, 6000)}`;
     }
   });
 
-  // API Route to analyze website
   app.post('/api/analyze-website', async (req, res) => {
     try {
       const { url } = req.body;
@@ -758,13 +825,12 @@ ${combinedText.substring(0, 6000)}`;
       }
 
       console.log(`Analyzing website: ${url}`);
-      
+
       let targetUrl = url;
       if (!targetUrl.startsWith('http://') && !targetUrl.startsWith('https://')) {
         targetUrl = 'https://' + targetUrl;
       }
 
-      // 1. Fetch Homepage
       const fetchPage = async (pageUrl: string): Promise<{html: string, text: string, ok: boolean}> => {
         try {
           const response = await axios.get(pageUrl, {
@@ -792,8 +858,7 @@ ${combinedText.substring(0, 6000)}`;
       }
 
       const $home = cheerio.load(homeData.html);
-      
-      // Extract favicon
+
       let favicon = $home('link[rel="icon"]').attr('href') || $home('link[rel="shortcut icon"]').attr('href') || $home('link[rel="apple-touch-icon"]').attr('href');
       if (favicon && !favicon.startsWith('http')) {
         try {
@@ -803,7 +868,6 @@ ${combinedText.substring(0, 6000)}`;
         }
       }
 
-      // Find links to Imprint, Privacy, Contact and deeper pages
       const internalLinks = new Set<string>();
       $home('a[href]').each((_, el) => {
         let href = $home(el).attr('href');
@@ -822,10 +886,9 @@ ${combinedText.substring(0, 6000)}`;
       const imprintLink = linksArray.find(l => /impressum|imprint|legal/i.test(l)) || `${targetUrl}/impressum`;
       const privacyLink = linksArray.find(l => /datenschutz|privacy/i.test(l)) || `${targetUrl}/datenschutz`;
       const contactLink = linksArray.find(l => /kontakt|contact/i.test(l)) || `${targetUrl}/kontakt`;
-      
-      // Find deep pages for team/about
-      const deepLinks = linksArray.filter(l => 
-        /team|ueber|about|person|profil|wir/i.test(l) && 
+
+      const deepLinks = linksArray.filter(l =>
+        /team|ueber|about|person|profil|wir/i.test(l) &&
         l !== imprintLink && l !== privacyLink && l !== contactLink
       ).slice(0, 3);
 
@@ -841,11 +904,8 @@ ${combinedText.substring(0, 6000)}`;
           combinedHtml += '\n' + page.html;
         }
       }
-      
-      // Clean up text
+
       combinedText = combinedText.replace(/\s+/g, ' ');
-      
-      // E-Mail Bereinigung
       combinedText = combinedText.replace(/\[email\s*protected\]/gi, '');
       combinedText = combinedText.replace(/\(email\s*protected\)/gi, '');
       combinedText = combinedText.replace(/\s*\[at\]\s*/gi, '@');
@@ -855,36 +915,27 @@ ${combinedText.substring(0, 6000)}`;
       combinedText = combinedText.replace(/\s*\(dot\)\s*/gi, '.');
       combinedText = combinedText.replace(/\s*\{dot\}\s*/gi, '.');
 
-      // --- Extract Data using Regex ---
-      
-      // 1. Email
       const emailRegex = /([a-zA-Z0-9._-]+@[a-zA-Z0-9._-]+\.[a-zA-Z0-9_-]+)/gi;
       const emails: string[] = combinedText.match(emailRegex) || [];
-      // Filter out common image extensions or invalid emails
       const validEmails = emails.filter(e => !e.endsWith('.png') && !e.endsWith('.jpg') && !e.endsWith('.jpeg') && !e.endsWith('.gif'));
-      // Prefer info@, kontakt@, etc.
       let email = validEmails.find(e => /info|kontakt|hello|office/i.test(e)) || validEmails[0] || '';
 
-      // 2. Phone
-      // Matches German/International formats like +49 123 45678, 0123/45678, 0123-45678, etc.
       const phoneRegex = /(?:(?:\+|00)49|0)[1-9][0-9 \-\/\(\)]{5,15}/g;
       const phones = combinedText.match(phoneRegex) || [];
       let phone = phones.length > 0 ? phones[0].trim() : '';
 
-      // 3. LinkedIn
       const linkedinRegex = /https?:\/\/(www\.)?linkedin\.com\/(company|in)\/[a-zA-Z0-9_-]+/i;
       const linkedinMatch = combinedHtml.match(linkedinRegex);
       const linkedinUrl = linkedinMatch ? linkedinMatch[0] : '';
 
-      // 4. Contact Person (Geschäftsführer / Inhaber) via Gemini
       let firstName = '';
       let lastName = '';
       let salutation = '';
-      
+
       try {
         const OpenAI = (await import('openai')).default;
         const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-        const prompt = `Analysiere den folgenden Text einer Firmenwebsite (Impressum, Kontakt, Über uns). 
+        const prompt = `Analysiere den folgenden Text einer Firmenwebsite (Impressum, Kontakt, Über uns).
 Finde den Hauptansprechpartner (Geschäftsführer, Inhaber, Vorstand, Praxisinhaber, Tierarzt, etc.).
 Achte darauf, E-Mail-Adressen zu korrigieren, falls sie maskiert sind (z.B. "info (at) domain.de" -> "info@domain.de"). Ignoriere "email protected".
 Antworte AUSSCHLIESSLICH im JSON-Format mit den Schlüsseln:
@@ -916,7 +967,6 @@ ${combinedText.substring(0, 6000)}`;
         console.error("OpenAI extraction failed:", e);
       }
 
-      // 5. Inhalt (Homepage Text)
       const inhalt = homeData.text.replace(/\s+/g, ' ').trim().substring(0, 1000);
 
       res.json({
@@ -937,7 +987,6 @@ ${combinedText.substring(0, 6000)}`;
     }
   });
 
-  // Vite middleware for development
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
       server: { middlewareMode: true },

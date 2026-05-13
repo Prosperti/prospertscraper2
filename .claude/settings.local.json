@@ -6,7 +6,8 @@
       "Bash(npm install *)",
       "Bash(npx tsc *)",
       "Bash(npm run *)",
-      "Bash(node -e \"require\\('dotenv'\\)\")"
+      "Bash(node -e \"require\\('dotenv'\\)\")",
+      "Bash(node --input-type=module -e ' *)"
     ]
   }
 }
