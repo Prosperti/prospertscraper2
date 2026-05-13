@@ -1,0 +1,17 @@
+[
+  {
+    "id": "1778659813521",
+    "timestamp": 1778659813521,
+    "date": "2026-05-13",
+    "config": {
+      "industries": [
+        "autohaus"
+      ],
+      "mode": "radius",
+      "city": "magdeburg",
+      "radius": 5,
+      "plzLabel": ""
+    },
+    "resultCount": 75
+  }
+]
